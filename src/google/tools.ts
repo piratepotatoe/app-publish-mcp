@@ -382,6 +382,30 @@ const haltRelease: ToolDef = {
   },
 };
 
+const updateRollout: ToolDef = {
+  name: 'google_update_rollout',
+  description: 'Update the staged rollout percentage of an in-progress release on a track. Use this to gradually increase (or decrease) the rollout fraction without creating a new release. Only works on production track with an inProgress release.',
+  schema: z.object({
+    packageName: z.string().describe('Android package name'),
+    editId: z.string().describe('Edit ID from google_create_edit'),
+    track: z.string().default('production').describe('Track name (usually production for staged rollouts)'),
+    userFraction: z.number().min(0.0).max(1.0).describe('New rollout fraction (0.0–1.0, e.g. 0.1 = 10%, 1.0 = full rollout)'),
+  }),
+  handler: async (client, args) => {
+    const trackData = await client.getTrack(args.packageName, args.editId, args.track);
+    const inProgress = trackData.releases?.find(r => r.status === 'inProgress');
+    if (!inProgress) throw new Error('No in-progress staged rollout found on track: ' + args.track);
+
+    inProgress.userFraction = args.userFraction;
+    if (args.userFraction >= 1.0) {
+      inProgress.status = 'completed';
+      delete inProgress.userFraction;
+    }
+
+    return client.updateTrack(args.packageName, args.editId, args.track, trackData.releases!);
+  },
+};
+
 // ═══════════════════════════════════════════
 // 7. Bundle / APK Upload
 // ═══════════════════════════════════════════
@@ -614,7 +638,7 @@ export const googleTools: ToolDef[] = [
   // Images
   listImages, uploadImage, deleteImage, deleteAllImages,
   // Tracks & Releases
-  listTracks, getTrack, createRelease, promoteRelease, haltRelease,
+  listTracks, getTrack, createRelease, promoteRelease, haltRelease, updateRollout,
   // Bundle / APK
   uploadBundle, uploadApk,
   // Reviews

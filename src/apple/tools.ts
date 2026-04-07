@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { gunzipSync } from 'zlib';
 import { AppleClient } from './client.js';
 
 // Helper to define a tool
@@ -1207,12 +1208,356 @@ const deleteSubscriptionGroup: ToolDef = {
 };
 
 // ═══════════════════════════════════════════
+// ═══════════════════════════════════════════
+// Create App
+// ═══════════════════════════════════════════
+
+const createApp: ToolDef = {
+  name: 'apple_create_app',
+  description: 'Create a new app in App Store Connect. Requires the Bundle ID resource ID (the "id" field from apple_list_bundle_ids or apple_create_bundle_id response, e.g. "4RPBXT8ZMV"), NOT the identifier string like "com.example.app".',
+  schema: z.object({
+    bundleIdResourceId: z.string().describe('Bundle ID resource ID (e.g. "4RPBXT8ZMV") from apple_create_bundle_id or apple_list_bundle_ids'),
+    name: z.string().describe('App name displayed on the App Store (max 30 chars)'),
+    primaryLocale: z.string().default('en-US').describe('Primary locale code, e.g. "en-US", "vi", "ja"'),
+    sku: z.string().describe('Unique internal SKU identifier for the app (e.g. "farm.animal.jam.puzzle")'),
+  }),
+  handler: async (client, args) => {
+    return client.request('/apps', {
+      method: 'POST',
+      body: {
+        data: {
+          type: 'apps',
+          attributes: {
+            name: args.name,
+            primaryLocale: args.primaryLocale,
+            sku: args.sku,
+          },
+          relationships: {
+            bundleId: {
+              data: { type: 'bundleIds', id: args.bundleIdResourceId },
+            },
+          },
+        },
+      },
+    });
+  },
+};
+
+// ═══════════════════════════════════════════
+// Phased Release (Staged Rollout)
+// ═══════════════════════════════════════════
+
+const managePhasedRelease: ToolDef = {
+  name: 'apple_manage_phased_release',
+  description: `Manage phased release (staged rollout) for an App Store version.
+- To ENABLE phased release for a version: provide versionId, set action to 'create'. Apple will roll out over 7 days automatically.
+- To PAUSE an active phased release: provide phasedReleaseId, set action to 'pause'.
+- To RESUME a paused phased release: provide phasedReleaseId, set action to 'resume'.
+- To COMPLETE (push to 100%) immediately: provide phasedReleaseId, set action to 'complete'.
+Use apple_list_versions or apple_get_app to find the versionId.`,
+  schema: z.object({
+    action: z.enum(['create', 'pause', 'resume', 'complete']).describe(
+      'create = enable phased release for a version; pause/resume/complete = manage existing phased release'
+    ),
+    versionId: z.string().optional().describe('App Store Version ID — required when action is "create"'),
+    phasedReleaseId: z.string().optional().describe('Phased Release ID — required for pause/resume/complete. Get it from the create response or apple_get_app.'),
+  }),
+  handler: async (client, args) => {
+    if (args.action === 'create') {
+      if (!args.versionId) throw new Error('versionId is required for action "create"');
+      return client.request('/appStoreVersionPhasedReleases', {
+        method: 'POST',
+        body: {
+          data: {
+            type: 'appStoreVersionPhasedReleases',
+            attributes: { phasedReleaseState: 'ACTIVE' },
+            relationships: {
+              appStoreVersion: {
+                data: { type: 'appStoreVersions', id: args.versionId },
+              },
+            },
+          },
+        },
+      });
+    }
+
+    if (!args.phasedReleaseId) throw new Error('phasedReleaseId is required for action "' + args.action + '"');
+
+    const stateMap: Record<string, string> = {
+      pause: 'PAUSED',
+      resume: 'ACTIVE',
+      complete: 'COMPLETE',
+    };
+
+    return client.request(`/appStoreVersionPhasedReleases/${args.phasedReleaseId}`, {
+      method: 'PATCH',
+      body: {
+        data: {
+          type: 'appStoreVersionPhasedReleases',
+          id: args.phasedReleaseId,
+          attributes: { phasedReleaseState: stateMap[args.action] },
+        },
+      },
+    });
+  },
+};
+
+// ═══════════════════════════════════════════
+// 19. Product Page Optimization (PPO) Experiments
+// ═══════════════════════════════════════════
+
+const PPO_V2 = 'https://api.appstoreconnect.apple.com/v2';
+
+const listPPOExperiments: ToolDef = {
+  name: 'apple_ppo_list_experiments',
+  description: 'List all Product Page Optimization (PPO) A/B test experiments for an app, including their state, traffic proportion, and dates. Use to check which experiments are running, pending review, or completed.',
+  schema: z.object({
+    appId: z.string().describe('App ID'),
+  }),
+  handler: async (client, args) => {
+    return client.request(`/apps/${args.appId}/appStoreVersionExperimentsV2`, {
+      params: { include: 'appStoreVersionExperimentTreatments' },
+    });
+  },
+};
+
+const createPPOExperiment: ToolDef = {
+  name: 'apple_ppo_create_experiment',
+  description: 'Create a new PPO experiment tied to a specific live App Store version. trafficProportion is the share of total traffic entering the experiment (e.g. 0.5 = 50%). After creating, add treatments with apple_ppo_create_treatment.',
+  schema: z.object({
+    appStoreVersionId: z.string().describe('The live App Store version ID to run the experiment on (must be READY_FOR_SALE). Get from apple_list_versions.'),
+    name: z.string().describe('Experiment name'),
+    trafficProportion: z.number().min(0).max(1).describe('Proportion of total traffic to include in the experiment (e.g. 0.5 = 50%)'),
+    platform: z.enum(['IOS', 'MAC_OS', 'TV_OS']).default('IOS').optional().describe('Platform (default IOS)'),
+  }),
+  handler: async (client, args) => {
+    return client.request(`${PPO_V2}/appStoreVersionExperiments`, {
+      method: 'POST',
+      body: {
+        data: {
+          type: 'appStoreVersionExperiments',
+          attributes: {
+            name: args.name,
+            trafficProportion: args.trafficProportion,
+            platform: args.platform ?? 'IOS',
+          },
+          relationships: {
+            appStoreVersion: {
+              data: { type: 'appStoreVersions', id: args.appStoreVersionId },
+            },
+          },
+        },
+      },
+    });
+  },
+};
+
+const updatePPOExperiment: ToolDef = {
+  name: 'apple_ppo_update_experiment',
+  description: `Manage the lifecycle of a PPO experiment:
+- action='submit': Send for Apple review (state → READY_FOR_REVIEW). Required before starting.
+- action='start': Begin running the experiment (requires state=APPROVED after Apple review).
+- action='stop': End the experiment permanently (state → STOPPED).
+- action='update': Change name or trafficProportion without changing state.`,
+  schema: z.object({
+    experimentId: z.string().describe('Experiment ID from apple_ppo_list_experiments or apple_ppo_create_experiment'),
+    action: z.enum(['update', 'submit', 'start', 'stop']).describe(
+      'submit=send for review, start=begin running (needs APPROVED state), stop=end experiment, update=modify name/traffic'
+    ),
+    name: z.string().optional().describe('New experiment name (action=update only)'),
+    trafficProportion: z.number().min(0).max(1).optional().describe('New traffic proportion (action=update only)'),
+  }),
+  handler: async (client, args) => {
+    const attributes: Record<string, any> = {};
+    if (args.action === 'submit') {
+      attributes.state = 'READY_FOR_REVIEW';
+    } else if (args.action === 'start') {
+      attributes.started = true;
+    } else if (args.action === 'stop') {
+      attributes.state = 'STOPPED';
+    } else {
+      if (args.name !== undefined) attributes.name = args.name;
+      if (args.trafficProportion !== undefined) attributes.trafficProportion = args.trafficProportion;
+    }
+    return client.request(`${PPO_V2}/appStoreVersionExperiments/${args.experimentId}`, {
+      method: 'PATCH',
+      body: {
+        data: {
+          type: 'appStoreVersionExperiments',
+          id: args.experimentId,
+          attributes,
+        },
+      },
+    });
+  },
+};
+
+const listPPOTreatments: ToolDef = {
+  name: 'apple_ppo_list_treatments',
+  description: 'List all treatments (variants) for a PPO experiment. Each treatment is one visual variant. Traffic proportions across all treatments must sum to 1.0.',
+  schema: z.object({
+    experimentId: z.string().describe('Experiment ID'),
+  }),
+  handler: async (client, args) => {
+    return client.request(
+      `${PPO_V2}/appStoreVersionExperiments/${args.experimentId}/appStoreVersionExperimentTreatments`,
+      { params: { include: 'appStoreVersionExperimentTreatmentLocalizations' } }
+    );
+  },
+};
+
+const createPPOTreatment: ToolDef = {
+  name: 'apple_ppo_create_treatment',
+  description: 'Create a treatment (variant) for a PPO experiment. After creating, use apple_ppo_create_treatment_localization to assign a locale, then upload screenshots with apple_upload_screenshot. trafficProportion across all treatments must sum to 1.0.',
+  schema: z.object({
+    experimentId: z.string().describe('Experiment ID'),
+    name: z.string().describe('Treatment name (e.g. "Lifestyle Screenshots", "Gameplay Screenshots")'),
+    trafficProportion: z.number().min(0).max(1).describe('Share of experiment traffic for this treatment (e.g. 0.5 = 50%). All treatments must sum to 1.0.'),
+  }),
+  handler: async (client, args) => {
+    return client.request('/appStoreVersionExperimentTreatments', {
+      method: 'POST',
+      body: {
+        data: {
+          type: 'appStoreVersionExperimentTreatments',
+          attributes: {
+            name: args.name,
+            trafficProportion: args.trafficProportion,
+          },
+          relationships: {
+            appStoreVersionExperiment: {
+              data: { type: 'appStoreVersionExperiments', id: args.experimentId },
+            },
+          },
+        },
+      },
+    });
+  },
+};
+
+const createPPOTreatmentLocalization: ToolDef = {
+  name: 'apple_ppo_create_treatment_localization',
+  description: 'Create a locale entry for a PPO treatment. After creating, the response contains screenshot set IDs — use apple_create_screenshot_set with the localization ID, then apple_upload_screenshot to upload the variant screenshots for that locale.',
+  schema: z.object({
+    treatmentId: z.string().describe('Treatment ID from apple_ppo_create_treatment'),
+    locale: z.string().describe('Locale code (e.g. "en-US", "ja", "ko", "vi")'),
+  }),
+  handler: async (client, args) => {
+    return client.request('/appStoreVersionExperimentTreatmentLocalizations', {
+      method: 'POST',
+      body: {
+        data: {
+          type: 'appStoreVersionExperimentTreatmentLocalizations',
+          attributes: { locale: args.locale },
+          relationships: {
+            appStoreVersionExperimentTreatment: {
+              data: { type: 'appStoreVersionExperimentTreatments', id: args.treatmentId },
+            },
+          },
+        },
+      },
+    });
+  },
+};
+
+const requestPPOAnalytics: ToolDef = {
+  name: 'apple_ppo_request_analytics',
+  description: 'Request an App Store engagement analytics report (impressions, downloads, conversion rates). Returns a requestId — call apple_ppo_get_analytics with that ID after 5–30 minutes to retrieve the actual data. Reports are generated asynchronously by Apple.',
+  schema: z.object({
+    appId: z.string().describe('App ID'),
+  }),
+  handler: async (client, args) => {
+    const result = await client.request('/analyticsReportRequests', {
+      method: 'POST',
+      body: {
+        data: {
+          type: 'analyticsReportRequests',
+          attributes: { accessType: 'ONE_TIME_SNAPSHOT' },
+          relationships: {
+            app: { data: { type: 'apps', id: args.appId } },
+          },
+        },
+      },
+    });
+    return {
+      requestId: result.data?.id,
+      message: 'Report request created. Wait 5–30 minutes then call apple_ppo_get_analytics with this requestId.',
+      raw: result,
+    };
+  },
+};
+
+const getPPOAnalytics: ToolDef = {
+  name: 'apple_ppo_get_analytics',
+  description: 'Fetch analytics data from a previously created report request (from apple_ppo_request_analytics). Automatically fetches the report chain, downloads and decompresses the gzipped CSV, and returns parsed rows with metrics like impressions, downloads, and conversion rates per treatment variant.',
+  schema: z.object({
+    requestId: z.string().describe('Analytics report request ID from apple_ppo_request_analytics'),
+    maxRows: z.number().optional().default(200).describe('Max CSV rows to return (default 200)'),
+  }),
+  handler: async (client, args) => {
+    // Step 1: List reports for this request
+    const reportsRes = await client.request(`/analyticsReportRequests/${args.requestId}/reports`);
+    const reports = reportsRes.data;
+    if (!reports || reports.length === 0) {
+      return { status: 'pending', message: 'No reports available yet. Try again in a few minutes.' };
+    }
+
+    // Step 2: Get instances for the first report
+    const reportId = reports[0].id;
+    const instancesRes = await client.request(`/analyticsReports/${reportId}/instances`);
+    const instances = instancesRes.data;
+    if (!instances || instances.length === 0) {
+      return { status: 'pending', reportId, message: 'Report found but no instances yet. Try again shortly.' };
+    }
+
+    // Step 3: Get download segments
+    const instanceId = instances[0].id;
+    const segmentsRes = await client.request(`/analyticsReportInstances/${instanceId}/segments`);
+    const segments = segmentsRes.data;
+    if (!segments || segments.length === 0) {
+      return { status: 'pending', instanceId, message: 'Instance found but no download segments yet.' };
+    }
+
+    // Step 4: Download gzipped CSV from signed S3 URL (no auth header needed)
+    const downloadUrl = segments[0].attributes?.url;
+    if (!downloadUrl) throw new Error('No download URL found in segment');
+
+    const gzipRes = await fetch(downloadUrl);
+    if (!gzipRes.ok) throw new Error(`Failed to download report: ${gzipRes.status} ${gzipRes.statusText}`);
+
+    const gzipBuffer = Buffer.from(await gzipRes.arrayBuffer());
+    const csvText = gunzipSync(gzipBuffer).toString('utf-8');
+
+    // Step 5: Parse tab-delimited CSV → JSON rows
+    const lines = csvText.split('\n').filter(l => l.trim());
+    if (lines.length === 0) return { status: 'ready', rowCount: 0, rows: [] };
+
+    const headers = lines[0].split('\t');
+    const maxRows = args.maxRows ?? 200;
+    const rows = lines.slice(1, maxRows + 1).map(line => {
+      const values = line.split('\t');
+      return Object.fromEntries(headers.map((h, i) => [h.trim(), (values[i] ?? '').trim()]));
+    });
+
+    return {
+      status: 'ready',
+      reportId,
+      instanceId,
+      segmentCount: segments.length,
+      totalLines: lines.length - 1,
+      rowCount: rows.length,
+      columns: headers,
+      rows,
+    };
+  },
+};
+
 // Export all tools
 // ═══════════════════════════════════════════
 
 export const appleTools: ToolDef[] = [
   // App Management
-  listApps, getApp, getAppInfo, updateAppInfoCategory,
+  listApps, getApp, getAppInfo, updateAppInfoCategory, createApp,
   // Bundle IDs
   listBundleIds, createBundleId,
   // Versions & Localizations
@@ -1226,8 +1571,8 @@ export const appleTools: ToolDef[] = [
   listBuilds, assignBuild,
   // Age Rating & Review Info
   getAgeRating, updateAgeRating, updateReviewDetail,
-  // Submission
-  submitForReview, cancelSubmission,
+  // Submission & Phased Release
+  submitForReview, cancelSubmission, managePhasedRelease,
   // Pricing & Availability
   getAppPricing, setAppPrice, listTerritoryAvailability,
   // Customer Reviews
@@ -1249,4 +1594,8 @@ export const appleTools: ToolDef[] = [
   listIAP, createIAP, getIAP, deleteIAP,
   // Subscription Groups
   listSubscriptionGroups, createSubscriptionGroup, deleteSubscriptionGroup,
+  // PPO Experiments
+  listPPOExperiments, createPPOExperiment, updatePPOExperiment,
+  listPPOTreatments, createPPOTreatment, createPPOTreatmentLocalization,
+  requestPPOAnalytics, getPPOAnalytics,
 ];
